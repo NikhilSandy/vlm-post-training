@@ -48,6 +48,19 @@ class OptionAttentionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             evaluator.option_positions(sample, prepared, tokenizer)
 
+    def test_multi_character_label_can_be_one_token(self):
+        prepared, sample, _, _ = fixture()
+        sample.categories[1].letter = "AB"
+        tokenizer = SimpleNamespace(decode=lambda ids: {11: " A", 13: " AB"}[ids[0]])
+        self.assertEqual(evaluator.option_positions(sample, prepared, tokenizer), ([1, 3], [11, 13]))
+
+    def test_seeded_shuffle_reassigns_every_option_and_preserves_the_token_set(self):
+        labels = [f"option-{index}" for index in range(80)]
+        shuffled = evaluator.shuffle_options(labels, 42)
+        self.assertEqual(shuffled, evaluator.shuffle_options(labels, 42))
+        self.assertCountEqual(shuffled, labels)
+        self.assertTrue(all(a != b for a, b in zip(shuffled, labels, strict=True)))
+
     def test_outgoing_attention_mean_then_rank_without_renormalization(self):
         prepared, _, _, weights = fixture()
         scores, mass = evaluator.option_attention_scores(weights, prepared, [1, 3])
@@ -62,6 +75,52 @@ class OptionAttentionTests(unittest.TestCase):
         prepared, _, _, _ = fixture()
         with self.assertRaises(RuntimeError):
             evaluator.option_attention_scores(None, prepared, [1, 3])
+
+    def test_per_head_predictions_match_independent_instance_votes(self):
+        prepared, _, _, weights = fixture()
+        regions = [
+            ({"id": 2, "category_id": 1}, np.array([.9, .1])),
+            ({"id": 3, "category_id": 2}, np.array([.5, .5])),
+        ]
+        coverage = torch.tensor(np.stack([weight for _, weight in regions]))
+        choices, support = evaluator.head_readout(weights[0], prepared, torch.tensor([1, 3]), coverage)
+        coco = SimpleNamespace(cats={1: {"name": "car"}, 2: {"name": "person"}})
+        record = {"image_id": 1, "classes": ["car", "person"], "status": "evaluated"}
+        output = evaluator.evaluate_layer_heads(record, coco, regions, choices.numpy(), support.numpy())
+        scores = weights[0, :, 4:, :][:, :, [1, 3]].numpy()
+        for region, (_, fraction) in zip(output["instances"], regions, strict=True):
+            expected = [record["classes"][evaluator.instance_vote(
+                head, evaluator.rank_options(head), fraction,
+            )[0]] for head in scores]
+            self.assertEqual(region["head_predictions"], expected)
+        summary = evaluator.summarize_heads([output], 1, 1, 4, 3)
+        self.assertEqual(len(summary["by_head"]), 3)
+        self.assertEqual(summary["overall"]["accuracy"], .5)
+
+    def test_qwen_batch_right_pads_text_and_concatenates_vision_in_order(self):
+        def image(ids, patches):
+            return SimpleNamespace(inputs={
+                "input_ids": torch.tensor([ids]),
+                "attention_mask": torch.ones(1, len(ids), dtype=torch.long),
+                "mm_token_type_ids": torch.ones(1, len(ids), dtype=torch.long),
+                "pixel_values": torch.full((patches, 2), patches),
+                "image_grid_thw": torch.tensor([[1, 1, patches]]),
+            })
+
+        batch = evaluator.collate_inputs([image([10, 11], 2), image([21], 3)], SimpleNamespace(pad_token_id=99))
+        self.assertEqual(batch["input_ids"].tolist(), [[10, 11], [21, 99]])
+        self.assertEqual(batch["attention_mask"].tolist(), [[1, 1], [1, 0]])
+        self.assertEqual(batch["mm_token_type_ids"].tolist(), [[1, 1], [1, 0]])
+        self.assertEqual(batch["pixel_values"][:, 0].tolist(), [2, 2, 3, 3, 3])
+        self.assertEqual(batch["image_grid_thw"].tolist(), [[1, 1, 2], [1, 1, 3]])
+
+    def test_linear_patch_projection_uses_the_original_convolution_weights(self):
+        projection = torch.nn.Conv3d(3, 5, kernel_size=(2, 4, 4), stride=(2, 4, 4))
+        visual = SimpleNamespace(patch_embed=SimpleNamespace(proj=projection))
+        patches = torch.randn(7, 3, 2, 4, 4)
+        expected = projection(patches).flatten(1)
+        evaluator.use_linear_patch_projection(visual)
+        torch.testing.assert_close(visual.patch_embed.proj(patches), expected)
 
     def test_patch_ties_have_stable_alphabetical_order(self):
         np.testing.assert_array_equal(evaluator.rank_options(np.array([[.2, .2, .1]])), [[0, 1, 2]])
@@ -88,49 +147,62 @@ class OptionAttentionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             evaluator.instance_vote(np.ones((2, 1)), np.zeros((2, 1), dtype=int), np.zeros(2))
 
-    def test_inference_captures_once_and_always_removes_hook(self):
+    def test_inference_captures_multiple_layers_in_one_pass_and_removes_hooks(self):
         prepared, sample, tokenizer, weights = fixture()
 
         class Attention(torch.nn.Module):
+            def __init__(self, weights):
+                super().__init__()
+                self.weights = weights
+
             def forward(self):
-                return None, weights
+                return None, self.weights
 
         class Core(torch.nn.Module):
             def __init__(self):
                 super().__init__()
                 self.embed_tokens = torch.nn.Embedding(16, 2)
-                self.attention = Attention()
+                self.attentions = torch.nn.ModuleList([
+                    Attention(weights), Attention(weights.flip(-1)),
+                ])
                 self.language_model = SimpleNamespace(
-                    layers=[SimpleNamespace(self_attn=self.attention)], embed_tokens=self.embed_tokens,
+                    layers=[SimpleNamespace(self_attn=attention) for attention in self.attentions],
+                    embed_tokens=self.embed_tokens,
                 )
+                self.calls = 0
                 self.fail = False
 
             def forward(self, **kwargs):
                 assert not torch.is_grad_enabled()
                 assert kwargs["use_cache"] is False
-                self.attention()
+                self.calls += 1
+                self.attentions[0]()
                 if self.fail:
                     raise RuntimeError("forward failed")
+                self.attentions[1]()
 
         core = Core()
         probe = SimpleNamespace(
             prepare=lambda sample: prepared, processor=SimpleNamespace(tokenizer=tokenizer),
             load_model=lambda: SimpleNamespace(model=core),
         )
-        _, scores, _, positions, _ = evaluator.read_option_attention(probe, sample, 1)
+        _, captured, positions, _ = evaluator.read_option_attention(probe, sample, (1, 2))
         self.assertEqual(positions, [1, 3])
-        np.testing.assert_allclose(scores, [[.18, .02], [.01, .04]], atol=1e-7)
-        self.assertFalse(core.attention._forward_hooks)
+        self.assertEqual(core.calls, 1)
+        self.assertEqual(set(captured), {1, 2})
+        np.testing.assert_allclose(captured[1][0], [[.18, .02], [.01, .04]], atol=1e-7)
+        np.testing.assert_array_equal(captured[2][0], np.zeros((2, 2)))
+        self.assertTrue(all(not attention._forward_hooks for attention in core.attentions))
         core.fail = True
         with self.assertRaisesRegex(RuntimeError, "forward failed"):
-            evaluator.read_option_attention(probe, sample, 1)
-        self.assertFalse(core.attention._forward_hooks)
+            evaluator.read_option_attention(probe, sample, (1, 2))
+        self.assertTrue(all(not attention._forward_hooks for attention in core.attentions))
 
     def test_no_gt_image_is_accounted_for_without_model_call(self):
         dataset = SimpleNamespace(coco=SimpleNamespace(
             imgToAnns={9: []}, imgs={9: {"file_name": "9.jpg"}},
         ))
-        record = evaluator.evaluate_image(dataset, None, 9, 32, None)
+        record = evaluator.evaluate_image(dataset, None, 9, {32: None})[32]
         self.assertEqual(record["status"], "no_gt_masks")
         summary = evaluator.summarize([record], 1, 1, 32)
         self.assertTrue(summary["complete"])
@@ -149,6 +221,12 @@ class OptionAttentionTests(unittest.TestCase):
         self.assertEqual(summary["multi_class"]["accuracy"], 0)
         self.assertEqual(summary["overall"]["uniform_guess"], .75)
         self.assertFalse(summary["full_dataset"])
+        for row in rows:
+            row["candidate_class_count"] = 80
+        summary = evaluator.summarize(records, 5000, 2, 32)
+        self.assertEqual(summary["overall"]["uniform_guess"], 1 / 80)
+        self.assertEqual(summary["single_class"]["total"], 1)
+        self.assertEqual(summary["multi_class"]["total"], 1)
 
     @unittest.skipUnless((evaluator.DEFAULT_EXPLORER / "probe.py").is_file(), "Gradio source unavailable")
     def test_gradio_prompt_is_reused_and_crowds_are_only_prompt_candidates(self):
@@ -173,20 +251,30 @@ class OptionAttentionTests(unittest.TestCase):
             sample = dataset.load(1)
             self.assertEqual(sample.prompt, "Find every instance of the listed categories in the image. Match each object region to the label after its category name.\n\ncar = A\nperson = B")
             prepared = SimpleNamespace(
-                image_start=4, inputs={"input_ids": torch.zeros(1, 6, dtype=torch.long)},
+                image_start=4, prompt_start=0, letters=(1, 3),
+                inputs={"input_ids": torch.tensor([[0, 11, 0, 13, 0, 0]])},
                 grid=SimpleNamespace(rows=1, cols=2, x_edges=(0, 2, 4), y_edges=(0, 2)),
             )
-            root.joinpath("patches").mkdir()
-            with patch.object(evaluator, "read_option_attention", return_value=(
-                prepared, np.array([[.03, .02], [.01, .04]]), np.ones(2), [1, 3], [11, 13],
-            )):
-                record = evaluator.evaluate_image(dataset, None, 1, 32, root / "patches")
+            tokenizer = SimpleNamespace(decode=lambda ids: {11: "A", 13: "B"}[ids[0]])
+            probe = SimpleNamespace(prepare=lambda _: prepared, processor=SimpleNamespace(tokenizer=tokenizer))
+            patch_dirs = {layer: root / f"layer_{layer:02d}" / "patches" for layer in (4, 8)}
+            for directory in patch_dirs.values():
+                directory.mkdir(parents=True)
+            with patch.object(evaluator, "forward_option_attention", return_value=[
+                {4: (np.array([[.03, .02], [.01, .04]]), np.ones(2)),
+                 8: (np.array([[.02, .03], [.06, .01]]), np.ones(2))},
+            ]):
+                records = evaluator.evaluate_image(dataset, probe, 1, patch_dirs)
+            record = records[4]
             self.assertEqual(record["classes"], ["car", "person"])
             self.assertEqual(len(record["instances"]), 1)
             self.assertEqual(record["instances"][0]["prediction"], "car")
-            with np.load(root / record["patch_file"]) as data:
+            self.assertEqual(records[8]["instances"][0]["prediction"], "person")
+            with np.load(patch_dirs[4].parent / record["patch_file"]) as data:
                 np.testing.assert_array_equal(data["votes"], [0, 1])
                 np.testing.assert_allclose(data["non_option_attention_mass"], [.95, .95])
+            with np.load(patch_dirs[8].parent / records[8]["patch_file"]) as data:
+                np.testing.assert_array_equal(data["votes"], [1, 0])
 
 
 if __name__ == "__main__":

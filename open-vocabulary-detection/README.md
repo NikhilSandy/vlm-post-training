@@ -63,6 +63,8 @@ The default is every validation image, including single-class images. The prompt
 lists the masked GT categories alphabetically as `category = A`, `category = B`, etc.
 Each patch votes for the option receiving the largest mean-head attention share.
 GT object masks aggregate those patch votes for instance-classification accuracy.
+The evaluator scores every even-numbered full-attention layer independently in
+one model pass per image batch. Use `--layer 32` to evaluate only layer 32.
 
 Use `--limit 3` for a smoke check. After installation, `coco-option-attention` is the
 equivalent console command. The original cosine/word-attention experiments remain
